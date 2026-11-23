@@ -32,10 +32,13 @@ public class DemoDataService {
     private final CryptoSupport crypto;
     private final LabRouteProperties props;
     private final com.labroute.db.SchemaService schemaService;
+    private final TemplateCatalogService catalog;
+    private final TemplateRouteGate gate;
 
     public DemoDataService(JdbcTemplate jdbc, TenantService tenants, AuthService auth, IntakeService intake,
                            CryptoSupport crypto, LabRouteProperties props,
-                           com.labroute.db.SchemaService schemaService) {
+                           com.labroute.db.SchemaService schemaService,
+                           TemplateCatalogService catalog, TemplateRouteGate gate) {
         this.jdbc = jdbc;
         this.tenants = tenants;
         this.auth = auth;
@@ -43,6 +46,8 @@ public class DemoDataService {
         this.crypto = crypto;
         this.props = props;
         this.schemaService = schemaService;
+        this.catalog = catalog;
+        this.gate = gate;
     }
 
     public String uniqueKey(String prefix) {
@@ -162,12 +167,36 @@ public class DemoDataService {
         return p;
     }
 
+    /** Sample carrying the demographics the reference interval evaluator resolves age bands on. */
+    public Map<String, Object> samplePayload(String sampleId, String sourceCode,
+                                             Long patientAgeDays, String patientSex) {
+        Map<String, Object> p = samplePayload(sampleId, sourceCode);
+        if (patientAgeDays != null) {
+            p.put("patientAgeDays", patientAgeDays);
+        }
+        if (patientSex != null) {
+            p.put("patientSex", patientSex);
+        }
+        return p;
+    }
+
     public Map<String, Object> resultPayload(String resultId, String sampleId, String analyte,
                                              String value, String unit, String refLow, String refHigh) {
+        return resultPayload(resultId, sampleId, analyte, "AU5800", value, unit, refLow, refHigh, null, null);
+    }
+
+    /**
+     * Result with explicit instrument and patient demographics. The legacy refLow/refHigh interval
+     * travels on the result row (baseline); the directory rules resolve the candidate interpretation.
+     */
+    public Map<String, Object> resultPayload(String resultId, String sampleId, String analyte,
+                                             String instrumentCode, String value, String unit,
+                                             String refLow, String refHigh,
+                                             Long patientAgeDays, String patientSex) {
         Map<String, Object> p = new LinkedHashMap<>();
         p.put("resultId", resultId);
         p.put("sampleId", sampleId);
-        p.put("instrumentCode", "AU5800");
+        p.put("instrumentCode", instrumentCode);
         p.put("analyteCode", analyte);
         p.put("value", value);
         p.put("unit", unit);
@@ -176,6 +205,12 @@ public class DemoDataService {
         p.put("measuredAt", OffsetDateTime.now().minusHours(1).toString());
         p.put("receivedAt", OffsetDateTime.now().toString());
         p.put("status", "FINAL");
+        if (patientAgeDays != null) {
+            p.put("patientAgeDays", patientAgeDays);
+        }
+        if (patientSex != null) {
+            p.put("patientSex", patientSex);
+        }
         return p;
     }
 
@@ -234,6 +269,48 @@ public class DemoDataService {
         deliveryBestEffort(tenant, "result", resultPayload(sampleId + "-R1", sampleId,
                 "GLU", "5.4", "mmol/L", "3.9", "5.5"));
         deliveryBestEffort(tenant, "report", reportPayload(sampleId + "-REP", sampleId, 1, "baseline"));
+        seedSemanticDirectory(tenant);
+    }
+
+    /**
+     * Seeds the unified semantic directory with the reference intervals the verification
+     * scenarios rely on: child/adult GLU bands, a second instrument's mapped interval, and
+     * creatinine bands. Everything starts PUBLISHED; the gate stays SHADOW so an operator
+     * (or a scenario) drives the GATED -> ENABLED lifecycle explicitly.
+     */
+    private void seedSemanticDirectory(Tenant tenant) {
+        try {
+            var rules = java.util.List.of(
+                    new TemplateCatalogService.RuleSpec("GLU", "AU5800", 0L, 17L * 365L, null,
+                            new java.math.BigDecimal("3.3"), new java.math.BigDecimal("5.6"),
+                            "mmol/L", "PEDIATRIC", 10),
+                    new TemplateCatalogService.RuleSpec("GLU", "AU5800", 18L * 365L, null, null,
+                            new java.math.BigDecimal("3.9"), new java.math.BigDecimal("6.1"),
+                            "mmol/L", "ADULT", 20),
+                    new TemplateCatalogService.RuleSpec("GLU", "BS2000", 18L * 365L, null, null,
+                            new java.math.BigDecimal("4.0"), new java.math.BigDecimal("6.3"),
+                            "mmol/L", "ADULT", 20),
+                    new TemplateCatalogService.RuleSpec("CREA", null, 0L, 17L * 365L, null,
+                            new java.math.BigDecimal("18"), new java.math.BigDecimal("60"),
+                            "umol/L", "PEDIATRIC", 10),
+                    new TemplateCatalogService.RuleSpec("CREA", null, 18L * 365L, null, null,
+                            new java.math.BigDecimal("45"), new java.math.BigDecimal("104"),
+                            "umol/L", "ADULT", 20));
+            Map<String, Object> ruleSet = catalog.createRuleSet(tenant.tenantId(),
+                    new TemplateCatalogService.RuleSetRequest("RS-INTERP", null, rules));
+            String ruleSetId = String.valueOf(ruleSet.get("rule_set_id"));
+            catalog.publishRuleSet(tenant.tenantId(), ruleSetId, java.time.Instant.now(), "seed baseline intervals");
+
+            Map<String, Object> template = catalog.createTemplate(tenant.tenantId(),
+                    new TemplateCatalogService.TemplateRequest("TPL-GLU", "GLU", "血糖解释模板",
+                            crypto.mapper().createObjectNode().put("layout", "standard-interp"),
+                            java.util.UUID.fromString(ruleSetId), null));
+            catalog.publishTemplate(tenant.tenantId(), String.valueOf(template.get("template_id")),
+                    java.time.Instant.now());
+            gate.ensureGate(tenant.tenantId(), TemplateRouteGate.MODE_REPLAYED);
+        } catch (Exception e) {
+            log.warn("semantic directory seed for {} failed: {}", tenant.code(), e.getMessage());
+        }
     }
 
     private void deliveryBestEffort(Tenant tenant, String kind, Map<String, Object> payload) {

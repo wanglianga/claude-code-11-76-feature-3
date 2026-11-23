@@ -59,7 +59,12 @@ public class CryptoSupport {
             return out;
         }
         if (node.isNumber()) {
-            return mapper.getNodeFactory().numberNode(node.decimalValue().stripTrailingZeros());
+            // Rebuild from the plain string: stripTrailingZeros() can produce a negative scale
+            // whose BigDecimal.toString() is scientific notation (100 -> "1E+2"), which would
+            // diverge from the canonical JSON other platforms sign over ("100").
+            java.math.BigDecimal stripped = node.decimalValue().stripTrailingZeros();
+            java.math.BigDecimal plain = new java.math.BigDecimal(stripped.toPlainString());
+            return mapper.getNodeFactory().numberNode(plain);
         }
         return node;
     }

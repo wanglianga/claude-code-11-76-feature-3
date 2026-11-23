@@ -26,6 +26,24 @@ class CryptoSupportTest {
     }
 
     @Test
+    void canonicalJsonNeverUsesScientificNotationForWholeNumbers() {
+        // Cross-language signing (e.g. Python json.dumps) renders 100 as "100", never "1E+2".
+        Map<String, Object> a = new LinkedHashMap<>();
+        a.put("patientAgeDays", 100);
+        a.put("b", 3650);
+        assertThat(crypto.canonicalJson(a)).isEqualTo("{\"b\":3650,\"patientAgeDays\":100}");
+
+        Map<String, Object> decimal = new LinkedHashMap<>();
+        decimal.put("low", new java.math.BigDecimal("3.90"));
+        decimal.put("high", new java.math.BigDecimal("6.10"));
+        assertThat(crypto.canonicalJson(decimal)).isEqualTo("{\"high\":6.1,\"low\":3.9}");
+
+        Map<String, Object> big = new LinkedHashMap<>();
+        big.put("n", new java.math.BigDecimal("123456789012345"));
+        assertThat(crypto.canonicalJson(big)).isEqualTo("{\"n\":123456789012345}");
+    }
+
+    @Test
     void hmacIsStableAndKeySensitive() {
         String sig1 = crypto.hmacSha256Hex("secret", "message");
         String sig2 = crypto.hmacSha256Hex("secret", "message");

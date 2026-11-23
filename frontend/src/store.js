@@ -70,8 +70,12 @@ export function formatTime(value) {
 
 export function stateTone(value) {
   const v = String(value || '').toUpperCase()
-  if (['VERIFIED', 'PASSED', 'PASS', 'STEADY_NEW', 'APPLIED', 'APPLIED_DUAL', 'COMPLETED', 'VALID'].includes(v)) return 'ok'
-  if (['PENDING_VERIFICATION', 'FLAGGED', 'BUFFERED', 'FENCED', 'DRAINING', 'LAGGING', 'DUAL_WRITE', 'READ_NEW', 'SHADOW_CHECK'].includes(v)) return 'warn'
-  if (['REJECTED', 'FAILED', 'FAIL', 'ROLLED_BACK'].includes(v)) return 'bad'
+  if (['VERIFIED', 'PASSED', 'PASS', 'STEADY_NEW', 'APPLIED', 'APPLIED_DUAL', 'COMPLETED', 'VALID',
+    'ENABLED', 'PUBLISHED', 'MATCH', 'ACCEPTED', 'DISMISSED', 'NORMAL', 'OK', 'BENIGN'].includes(v)) return 'ok'
+  if (['PENDING_VERIFICATION', 'FLAGGED', 'BUFFERED', 'FENCED', 'DRAINING', 'LAGGING', 'DUAL_WRITE',
+    'READ_NEW', 'SHADOW_CHECK', 'GATED', 'SHADOW', 'DRAFT', 'DIVERGED', 'INCONCLUSIVE', 'OPEN',
+    'EXPECTED', 'ACTION_REQUIRED', 'LOW', 'HIGH', 'MATERIALIZED', 'REPLAYED'].includes(v)) return 'warn'
+  if (['REJECTED', 'FAILED', 'FAIL', 'ROLLED_BACK', 'BLOCKED', 'WITHDRAWN', 'BLOCKING',
+    'INDETERMINATE'].includes(v)) return 'bad'
   return 'muted'
 }

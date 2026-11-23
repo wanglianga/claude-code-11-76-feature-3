@@ -5,7 +5,7 @@ import { readFileSync, readdirSync } from 'node:fs'
 import { JSDOM, VirtualConsole } from 'jsdom'
 
 const API = process.env.API || 'http://127.0.0.1:8080'
-const dist = '/workspace/76/frontend/dist'
+const dist = process.env.DIST || `${process.cwd()}/dist`
 const html = readFileSync(`${dist}/index.html`, 'utf8').replace(/<script[^>]*src="[^"]*"[^>]*><\/script>/, '')
 const asset = readdirSync(`${dist}/assets`).find((f) => f.endsWith('.js'))
 const bundle = readFileSync(`${dist}/assets/${asset}`, 'utf8')
@@ -42,6 +42,7 @@ const routes = [
   ['/migration', '迁移控制'],
   ['/gateway', '样本接收网关'],
   ['/publishing', '连续发布台'],
+  ['/semantic', '统一语义路由'],
   ['/boundary', '租户边界册'],
   ['/lab', '验证实验室']
 ]

@@ -311,6 +311,160 @@ public class SchemaService {
               started_at timestamptz not null default now(),
               finished_at timestamptz
             );
+
+            -- ===== Unified semantic routing: template directory, reference interval rules, =====
+            -- ===== materialised interpretations, shadow renders, diff triage and enable gate. =====
+
+            create table if not exists lab.template_catalog (
+              template_id uuid primary key,
+              tenant_id uuid references lab.tenant(tenant_id) on delete cascade,
+              template_code text not null,
+              version int not null,
+              analyte_code text not null,
+              name text not null,
+              status text not null default 'DRAFT',
+              rule_set_id uuid,
+              content jsonb not null default '{}'::jsonb,
+              effective_from timestamptz,
+              effective_to timestamptz,
+              withdrawn_at timestamptz,
+              withdrawn_reason text,
+              created_at timestamptz not null default now(),
+              updated_at timestamptz not null default now(),
+              unique (tenant_id, template_code, version)
+            );
+            create index if not exists ix_template_tenant on lab.template_catalog(tenant_id, analyte_code, status);
+
+            create table if not exists lab.reference_rule_set (
+              rule_set_id uuid primary key,
+              tenant_id uuid references lab.tenant(tenant_id) on delete cascade,
+              rule_set_code text not null,
+              version int not null,
+              status text not null default 'DRAFT',
+              effective_from timestamptz,
+              effective_to timestamptz,
+              withdrawn_at timestamptz,
+              withdrawn_reason text,
+              created_at timestamptz not null default now(),
+              updated_at timestamptz not null default now(),
+              unique (tenant_id, rule_set_code, version)
+            );
+            create index if not exists ix_rule_set_tenant on lab.reference_rule_set(tenant_id, status);
+
+            create table if not exists lab.reference_interval_rule (
+              rule_id uuid primary key,
+              rule_set_id uuid not null references lab.reference_rule_set(rule_set_id) on delete cascade,
+              tenant_id uuid not null,
+              analyte_code text not null,
+              instrument_code text,
+              age_low_days bigint not null default 0,
+              age_high_days bigint,
+              sex text,
+              ref_low numeric(18,6),
+              ref_high numeric(18,6),
+              unit text not null,
+              flag_label text not null default 'NORMAL',
+              priority int not null default 100,
+              status text not null default 'ACTIVE',
+              effective_from timestamptz not null default now(),
+              effective_to timestamptz,
+              created_at timestamptz not null default now()
+            );
+            create index if not exists ix_interval_rule_lookup
+              on lab.reference_interval_rule(tenant_id, analyte_code, instrument_code, status);
+
+            create table if not exists lab.report_interpretation (
+              interpretation_id uuid primary key,
+              tenant_id uuid not null,
+              report_id text not null,
+              revision int not null,
+              sample_id text,
+              result_id text,
+              analyte_code text not null,
+              template_id uuid,
+              rule_set_id uuid,
+              rule_id uuid,
+              rule_set_version text,
+              history_mode text not null,
+              report_time timestamptz not null,
+              value_num numeric(18,6),
+              unit text,
+              ref_low numeric(18,6),
+              ref_high numeric(18,6),
+              flag text not null,
+              rendered_text text,
+              content_hash text not null,
+              created_at timestamptz not null default now(),
+              unique (tenant_id, report_id, revision, result_id)
+            );
+            create index if not exists ix_interpretation_report
+              on lab.report_interpretation(tenant_id, report_id, revision);
+
+            create table if not exists lab.shadow_render (
+              shadow_id uuid primary key,
+              tenant_id uuid not null,
+              report_id text not null,
+              revision int not null,
+              run_reason text not null default 'MANUAL',
+              baseline_label text not null,
+              candidate_label text not null,
+              baseline_hash text,
+              candidate_hash text,
+              baseline_payload jsonb not null default '{}'::jsonb,
+              candidate_payload jsonb not null default '{}'::jsonb,
+              result text not null,
+              diff_count int not null default 0,
+              created_at timestamptz not null default now()
+            );
+            create index if not exists ix_shadow_report on lab.shadow_render(tenant_id, report_id, created_at desc);
+
+            create table if not exists lab.shadow_triage (
+              triage_id uuid primary key,
+              shadow_id uuid references lab.shadow_render(shadow_id) on delete cascade,
+              tenant_id uuid not null,
+              report_id text not null,
+              revision int,
+              result_id text,
+              analyte_code text,
+              diff_type text not null,
+              severity text not null,
+              status text not null default 'OPEN',
+              rule_id uuid,
+              rule_set_id uuid,
+              detail jsonb not null default '{}'::jsonb,
+              resolution_note text,
+              created_at timestamptz not null default now(),
+              resolved_at timestamptz
+            );
+            create index if not exists ix_triage_gate on lab.shadow_triage(tenant_id, status, severity);
+
+            create table if not exists lab.template_route_gate (
+              gate_id uuid primary key,
+              tenant_id uuid not null unique references lab.tenant(tenant_id) on delete cascade,
+              state text not null default 'SHADOW',
+              history_mode text not null default 'REPLAYED',
+              candidate_template_id uuid,
+              candidate_rule_set_id uuid,
+              active_template_id uuid,
+              active_rule_set_id uuid,
+              open_triage_count int not null default 0,
+              blocking_triage_count int not null default 0,
+              last_shadow_result text,
+              last_gate_reason text,
+              created_at timestamptz not null default now(),
+              updated_at timestamptz not null default now()
+            );
+
+            create table if not exists lab.template_gate_event (
+              event_id uuid primary key,
+              tenant_id uuid not null,
+              from_state text,
+              to_state text not null,
+              reason text,
+              detail jsonb not null default '{}'::jsonb,
+              created_at timestamptz not null default now()
+            );
+            create index if not exists ix_gate_event_tenant on lab.template_gate_event(tenant_id, created_at desc);
             """;
 
     /**
@@ -381,6 +535,8 @@ public class SchemaService {
     @PostConstruct
     public void init() {
         runScript(CONTROL_DDL);
+        // Idempotent repairs for databases created before a column was added.
+        jdbc.execute("alter table lab.reference_rule_set add column if not exists updated_at timestamptz not null default now()");
         log.info("control-plane schema ready");
     }
 

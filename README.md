@@ -31,8 +31,12 @@
 ├─ intake_buffer（围栏内有序缓冲）              └─ applied_message（按 message_id 幂等去重）
 ├─ fence / migration（状态机与闸门）
 ├─ watermark（表/对象/消息确认位置）
-├─ shadow_comparison（影子比对）
+├─ shadow_comparison（空间影子比对）
 ├─ semantic_finding（语义校验发现）
+├─ template_catalog / reference_rule_set        统一语义路由（迁移后单一解释目录）
+│   / reference_interval_rule（模板+区间规则版本） ├─ report_interpretation（物化/回放的历史解释）
+├─ report_interpretation / shadow_render        ├─ shadow_render（基线 vs 候选渲染与哈希）
+│   / shadow_triage（影子渲染+差异分诊）         └─ template_route_gate / template_gate_event（启用闸门）
 ├─ report_publication（每版报告来源空间+可见状态）
 ├─ evidence_log（哈希链证据账）
 └─ rollback_record（回退范围与水位快照）
@@ -44,6 +48,28 @@
 - **接入持久化优先**：`IntakeService.intake()` 先落 `intake_message` 再应用 / 缓冲；语义拒收的消息同样落库（HTTP 422 仍带回执）。
 - **发布显式化**：`PublicationService.publish()` 只从 `tenant.read_space` 单一 schema 取最新修订；围栏缓冲 / 校验未通过 / 仅存在于另一空间时返回 `202 + PENDING_VERIFICATION`。
 - **证据链**：`EvidenceService` 以 `sha256(prev_hash + 内容)` 串联，`verifyChain()` 可检出篡改或被删条目。
+- **语义闸门唯一翻转**：目录解释是否可服务只在 `TemplateRouteGate` 翻转（SHADOW→GATED→ENABLED/BLOCKED）；撤回生效规则集时服务端 fail-closed，发布接口仍连续可用。
+
+---
+
+## 1.1 统一语义路由（模板语义目录 · 区间求值 · 影子渲染 · 差异分诊 · 启用闸门）
+
+迁移后各租户的报告模板与参考区间统一路由，但**同一分析物可因仪器、患者年龄和生效日期不同而有不同解释**。平台用五个协作组件实现，并完整保留两种历史策略：
+
+| 组件 | 职责 | 代码 |
+| --- | --- | --- |
+| 模板语义目录 | 模板与规则集的版本化目录，生命周期 `DRAFT→PUBLISHED→WITHDRAWN`，均带生效时间窗；撤回只关闭窗口、不删行，历史报告仍可按时点解析 | `TemplateCatalogService` |
+| 参考区间求值器 | 按 分析物 + 仪器 + 年龄带 + 生效日期 解析唯一规则，产出 `LOW/NORMAL/HIGH`；仪器精确匹配优先于通配、窄年龄带优先于通配 | `ReferenceIntervalEvaluator` |
+| 影子渲染器 | 对同一报告分别渲染**基线**（结果携带的旧区间）与**候选**（目录按报告时点求值），哈希比对；并负责历史物化/回放 | `ShadowRenderer` |
+| 差异分诊器 | 把差异归类为 `AGE_BOUNDARY`/`INSTRUMENT_SWITCH`/`RULE_WITHDRAWN`/`INTERVAL_DRIFT`/`FLAG_CHANGE`/`UNIT_MISMATCH`/`NO_RULE`/`RENDER_ONLY`，定级 `BENIGN/EXPECTED/ACTION_REQUIRED/BLOCKING` | `ShadowDiffTriage` |
+| 启用闸门 | 每租户 `SHADOW→GATED→ENABLED/BLOCKED`；存在 OPEN 的 BLOCKING 分诊或候选/生效规则被撤回时**拒绝启用** | `TemplateRouteGate` |
+
+两种历史解释策略（均可经 API 与闸门切换实跑）：
+
+- **MATERIALIZED**：切换前为每份历史报告物化旧解释到 `lab.report_interpretation`，查询稳定、不依赖当前规则目录，代价是修订维护重；若闸门处于该模式却缺少物化行，路由显式报 `INTERPRETATION_NOT_MATERIALIZED`，绝不静默回退到实时规则。
+- **REPLAYED**：只保留规则版本，按报告时点从生效窗重建解释，存储少；读取依赖可靠回放（生效窗 schema 保证确定性）。
+
+fail-closed 语义：生效规则集在发布后被撤回时，下一次解释服务把闸门翻成 `BLOCKED` 并返回 409（`RULE_WITHDRAWN`/`SEMANTIC_ROUTE_BLOCKED`）；报告本身仍连续发布，响应中显式携带 `semanticGateState=BLOCKED` 与阻断原因，而不是静默换用别的规则版本。
 
 ---
 
@@ -126,12 +152,16 @@ python3 scripts/e2e_verify.py                     # BASE 默认 http://127.0.0.1
 BASE=http://host:8080 TENANT=lab-harbor python3 scripts/e2e_verify.py
 ```
 
-脚本自签 HMAC、自管幂等键，不 import 任何 Java 代码、不直连数据库；**通过即证明网关鉴权、路由闸门、发布接口三者真实一致**。覆盖题目指定的四个样例：
+脚本自签 HMAC、自管幂等键，不 import 任何 Java 代码、不直连数据库；**通过即证明网关鉴权、路由闸门、发布接口三者真实一致**。覆盖题目指定的五组样例：
 
 1. **仪器迟到结果**：先发布报告→后到结果；验证回执可持久化、结果进入当前读空间、重发幂等、报告来源空间可命名。
 2. **报告修订**：修订 2 取代 1；发布服务最新已验证版本、历史可回放、证据链完整；非法修订关系被 422 拒收但持久化。
 3. **租户隔离策略变化**：`policy_version` 递增、隔离级别生效、跨租户密钥被 `AUTH_KEY_UNKNOWN` 拒绝、四象限空间无共享主键。
 4. **切换围栏内三连消息**：连续三条消息按 `seq` 回执并 `BUFFERED`；围栏内发布返回 `202 PENDING_VERIFICATION`；按序排空→一次性放行→读/写切到 `NEW`；报告转为 `NEW` 上的 `VERIFIED`；证据回放 `OLD→NEW`；回退后读空间回到 `OLD` 且基线报告仍 `VERIFIED`、证据链完整。
+5. **统一语义路由**：新建带儿童/成人 GLU 区间与双仪器（AU5800/BS2000）规则的规则集，
+   - **儿童与成人区间交接**：10 岁患儿 5.55 mmol/L 在旧成人区间为 HIGH，目录儿童区间（3.3–5.6）求值为 NORMAL，影子渲染产出 `AGE_BOUNDARY` + `FLAG_CHANGE`；
+   - **仪器更换**：成人样本在新仪器 BS2000 上 6.2，旧 AU5800 区间 HIGH、目录 BS2000 区间（4.0–6.3）NORMAL，产出 `INSTRUMENT_SWITCH`；
+   - **规则发布中撤回**：闸门 ENABLED 后撤回生效规则集，解释路由 409 fail-closed、闸门翻 BLOCKED，而报告发布仍 200 VERIFIED；并核验 REPLAYED 权威回放与 MATERIALIZED 历史旧解释（HIGH）冻结。
 
 ### 4.2 后端自动化测试
 
@@ -140,16 +170,18 @@ cd backend && /opt/maven/bin/mvn test      # 需要本机 PostgreSQL；测试库
 ```
 
 - `SemanticValidatorTest`：主键 / 单位 / 参考区间 / 修订关系规则（8 项）。
-- `CryptoSupportTest`：规范化 JSON、HMAC、签名串绑定、常量时间比较（4 项）。
+- `CryptoSupportTest`：规范化 JSON、HMAC、签名串绑定、常量时间比较，以及**整数规范化不得产生科学计数法**的跨语言签名回归（5 项）。
+- `ShadowDiffTriageTest`：年龄交接、仪器更换、撤回阻断、无规则/单位阻断、纯漂移、纯渲染差异分类（7 项，纯单元测试）。
 - `RoutingGateIntegrationTest`：围栏路线、在线路线先切读后切写、回退恢复旧读空间、双写幂等（4 项，真实 PG）。
+- `SemanticRoutingIntegrationTest`：儿童/成人交接、仪器更换、撤回 fail-closed、阻断拒绝启用、两种历史策略、`SEMANTIC_ROUTING` 全场景（5 项，真实 PG）。
 
 ### 4.3 控制台内置「验证实验室」
 
-前端「验证实验室」页可逐个 / 一键运行上述四场景，逐条断言附带证据（`/api/scenarios/...`）。已保存的实跑证据见 `artifacts/*_run.json`。
+前端「验证实验室」页可逐个 / 一键运行上述五场景，逐条断言附带证据（`/api/scenarios/...`）。已保存的实跑证据见 `artifacts/*_run.json`（含 `semantic_routing_run.json`，12 断言）。
 
 ### 4.4 前端渲染冒烟
 
-`scripts/smoke-dom.mjs` 用 jsdom 加载**真实生产构建产物**、`fetch` 指向真实后端，断言六个页面挂载出正确标题并渲染真实租户数据、无运行时错误。运行前先 `cd frontend && npm run build`，再从 `frontend/` 目录执行（jsdom 由前端的 `devDependencies` 提供）：
+`scripts/smoke-dom.mjs` 用 jsdom 加载**真实生产构建产物**、`fetch` 指向真实后端，断言七个页面（含「语义路由」）挂载出正确标题并渲染真实租户数据、无运行时错误。运行前先 `cd frontend && npm run build`，再从 `frontend/` 目录执行（jsdom 由前端的 `devDependencies` 提供，产物路径可用 `DIST` 覆盖，默认 `$PWD/dist`）：
 
 ```bash
 cd frontend && cp ../scripts/smoke-dom.mjs . && node smoke-dom.mjs && rm smoke-dom.mjs
@@ -176,21 +208,30 @@ cd frontend && cp ../scripts/smoke-dom.mjs . && node smoke-dom.mjs && rm smoke-d
 5. `.../migration/online/switch-write` → 无未复制行且比对通过后 `write=NEW`，完成。
 6. `.../migration/rollback` 回退到 OLD。
 
+### 5.1 统一语义路由（控制面均需 `X-Operator-Token`，前缀 `/api/tenants/{t}/semantic`）
+
+1. `POST /rule-sets`（带 `rules[]`：analyte/instrument/ageLowDays/ageHighDays/refLow/refHigh/unit）→ DRAFT 规则集；`POST /rule-sets/{id}/publish` 发布、`/withdraw` 撤回（撤回即关生效窗）。
+2. `GET /gate` 查看闸门；`POST /gate/init {"historyMode":"REPLAYED|MATERIALIZED"}` 初始化为 SHADOW。
+3. `POST /shadow/render {"space":"OLD","reportId":...,"ruleSetId":...}` 渲染基线 vs 候选，结果写 `shadow_render`，差异写 `shadow_triage`；`GET /triage` 查看，`POST /triage/{id}/resolve {"decision":"ACCEPT|DISMISS"}` 分诊。
+4. `POST /gate/begin {"ruleSetId":...,"historyMode":...}` → GATED 钉住候选版本；`POST /gate/enable` 仅在无 OPEN BLOCKING 分诊且候选仍 PUBLISHED 时放行，否则 409 `ROUTE_GATE_BLOCKED`。
+5. 历史策略：`POST /history/materialize`（物化旧解释）或 `POST /history/replay`（按报告时点回放）；`GET /reports/{reportId}/interpretation` 取受闸门约束的解释（BLOCKED 时 409）。
+6. 撤回生效规则集：`POST /rule-sets/{activeId}/withdraw` → 闸门立即/在下次服务时 fail-closed 到 BLOCKED；`POST /gate/reset` 可回到 SHADOW 重新评估新版本。
+
 ---
 
 ## 6. 验证结论（仅记录实际执行过的结果）
 
 以下为在本容器内、对 `127.0.0.1:8080` 的**真实运行**结果：
 
-- ✅ **后端测试**：`mvn test` → `Tests run: 16, Failures: 0, Errors: 0`（SemanticValidator 8 / CryptoSupport 4 / RoutingGate 集成 4）。
-- ✅ **端到端脚本**：`python3 scripts/e2e_verify.py` → `34/34 assertions passed`，`E2E_RESULT: PASS`；在**清空数据库后冷启动**再跑仍 `34/34 PASS`，且可重复运行（回退与策略恢复保证收敛）。
-- ✅ **路线二实跑**：对 `lab-lumen` 执行 `start → dual-write → shadow-check → switch-read → switch-write`，双写时 `OLD+NEW` 各 1 行、切读后发布来源空间为 `NEW`、切写后新消息仅入 `NEW`。
-- ✅ **Swagger/OpenAPI**：`/swagger-ui/index.html` 返回 200；`/v3/api-docs` 为 `openapi 3.1.0`，46 条路径。
-- ✅ **控制台场景**：`artifacts/{late_result,report_revision,isolation_change,fence_burst}_run.json` 均为 `PASSED`（5/7/6/12 断言）。
-- ✅ **前端渲染冒烟**：`SMOKE_RESULT: PASS`，六页标题正确、无运行时错误。
+- ✅ **后端测试**：`mvn test` → `Tests run: 29, Failures: 0, Errors: 0`（SemanticValidator 8 / CryptoSupport 5 / ShadowDiffTriage 7 / RoutingGate 集成 4 / SemanticRouting 集成 5）。
+- ✅ **端到端脚本**：`python3 scripts/e2e_verify.py` → `47/47 assertions passed`，`E2E_RESULT: PASS`；在**清空数据库后冷启动**再跑仍 `47/47 PASS`，且可重复运行（回退、策略恢复与场景首尾清理保证收敛）。
+- ✅ **语义路由三样例**：儿童/成人交接产出 `AGE_BOUNDARY`（HIGH→NORMAL）、仪器更换产出 `INSTRUMENT_SWITCH`、规则撤回后解释路由 409 且闸门 `BLOCKED` 而报告仍 200 `VERIFIED`；REPLAYED 权威回放为 NORMAL、MATERIALIZED 历史冻结为 HIGH。
+- ✅ **验证实验室**：五场景 `run-all` 全部 `PASSED`（5/7/6/12/12 断言）；`artifacts/semantic_routing_run.json` 为新场景 12 断言实跑证据。
+- ✅ **Swagger/OpenAPI**：`/swagger-ui/index.html` 返回 200；`/v3/api-docs` 为 `openapi 3.1.0`，71 条路径。
+- ✅ **前端渲染冒烟**：`SMOKE_RESULT: PASS`，七页（含「语义路由」）标题正确、渲染真实数据、无运行时错误。
 - ⚠️ **未执行**：`docker compose up`（本执行容器无 Docker CLI）。Dockerfile / Compose / nginx 配置已按多阶段构建与反代写好，构建步骤为本地等价命令所验证的同一流程。
 
-> 迁移期间的连续性由两处保证：网关在 `FENCE`/`DUAL`/`NEW` 任一写空间下都先持久化再回执；发布接口在任一阶段都返回“已验证版本 + 来源空间”或“显式待验证 + 原因”。冻结的是**写入排序**，不是接收或发布。
+> 迁移期间的连续性由两处保证：网关在 `FENCE`/`DUAL`/`NEW` 任一写空间下都先持久化再回执；发布接口在任一阶段都返回“已验证版本 + 来源空间”或“显式待验证 + 原因”。语义路由额外保证：目录解释仅在闸门 ENABLED 时权威，撤回即 fail-closed，但报告发布永不因语义阻断而停服。冻结的是**写入排序**，不是接收或发布。
 
 ---
 
@@ -199,19 +240,21 @@ cd frontend && cp ../scripts/smoke-dom.mjs . && node smoke-dom.mjs && rm smoke-d
 ```
 backend/                 Spring Boot 3.5 / Java 21
   src/main/java/com/labroute/
-    db/SchemaService     控制面 + 每租户物理 schema DDL、自愈式建空间
+    db/SchemaService     控制面 + 每租户物理 schema DDL、自愈式建空间/补列
     service/             Auth, Intake, SpaceWriter, Migration, Replication,
                          Publication, SemanticValidator, Evidence, Policy,
+                         TemplateCatalog, ReferenceIntervalEvaluator, ShadowRenderer,
+                         ShadowDiffTriage, TemplateRouteGate, SemanticRouting,
                          Scenario, DemoData, Crypto
-    web/                 控制器 + 异常映射 + 运维令牌
-  src/test/              单元 + 集成测试
+    web/                 控制器（含 SemanticRoutingController）+ 异常映射 + 运维令牌
+  src/test/              单元 + 集成测试（29 项）
   Dockerfile
-frontend/                Vue 3 + Vite 控制台（六视图）
+frontend/                Vue 3 + Vite 控制台（七视图，含语义路由）
   Dockerfile, nginx.conf
 scripts/
-  e2e_verify.py          独立端到端验证（真实 HTTP + HMAC）
+  e2e_verify.py          独立端到端验证（真实 HTTP + HMAC，47 断言）
   smoke-dom.mjs          jsdom 渲染冒烟（真实构建产物）
   screenshot.mjs         截图脚本（需 Chromium，本容器缺系统库未执行）
 compose.yaml             Postgres + 后端 + 前端
-artifacts/               本次实跑的场景 JSON 证据
+artifacts/               本次实跑的场景 JSON 证据（含 semantic_routing_run.json）
 ```

@@ -8,10 +8,12 @@ routing gate and the real publication interface agree. It does not import any Ja
 code and does not touch the database directly.
 
 Covered scenarios (the ones required by the brief):
-  1. LATE_RESULT     instrument result arrives after its report was already published
-  2. REPORT_REVISION revision 2 supersedes revision 1; invalid relation is rejected but kept
-  3. ISOLATION_CHANGE  tenant isolation policy changes; cross-tenant key is refused
-  4. FENCE_BURST     three messages arrive back-to-back inside a switch fence
+  1. LATE_RESULT        instrument result arrives after its report was already published
+  2. REPORT_REVISION    revision 2 supersedes revision 1; invalid relation is rejected but kept
+  3. ISOLATION_CHANGE   tenant isolation policy changes; cross-tenant key is refused
+  4. FENCE_BURST        three messages arrive back-to-back inside a switch fence
+  5. SEMANTIC_ROUTING   child/adult interval handoff, instrument replacement and rule
+                        withdrawal: shadow diffs, historical display and gate route blocking
 
 Run:
   python3 scripts/e2e_verify.py                # against http://127.0.0.1:8080
@@ -132,12 +134,31 @@ def sample_payload(sid: str) -> dict:
     }
 
 
+def sample_payload_aged(sid: str, age_days: int, sex: str | None = None) -> dict:
+    p = sample_payload(sid)
+    p["patientAgeDays"] = age_days
+    if sex:
+        p["patientSex"] = sex
+    return p
+
+
 def result_payload(rid: str, sid: str, value="5.4", unit="mmol/L") -> dict:
     return {
         "resultId": rid, "sampleId": sid, "instrumentCode": "AU5800", "analyteCode": "GLU",
         "value": value, "unit": unit, "refLow": "3.9", "refHigh": "5.5",
         "measuredAt": datetime.now(timezone.utc).isoformat(), "status": "FINAL",
     }
+
+
+def result_payload_full(rid: str, sid: str, instrument: str, value: str, low: str, high: str,
+                        age_days: int, analyte: str = "GLU", unit: str = "mmol/L") -> dict:
+    p = {
+        "resultId": rid, "sampleId": sid, "instrumentCode": instrument, "analyteCode": analyte,
+        "value": value, "unit": unit, "refLow": low, "refHigh": high,
+        "measuredAt": datetime.now(timezone.utc).isoformat(), "receivedAt": datetime.now(timezone.utc).isoformat(),
+        "status": "FINAL", "patientAgeDays": age_days,
+    }
+    return p
 
 
 def report_payload(rep: str, sid: str, revision: int, extra: dict | None = None) -> dict:
@@ -350,6 +371,111 @@ def scenario_fence_burst() -> None:
            f"space={restored.get('sourceSpace')} state={restored.get('visibleState')}")
 
 
+def scenario_semantic_routing() -> None:
+    print("\n=== 5. 统一语义路由：儿童/成人交接·仪器更换·规则撤回 ===")
+    base = f"/api/tenants/{TENANT}/semantic"
+    http("POST", f"{base}/gate/reset", {"reason": "e2e precondition"}, operator_headers())
+
+    # Fresh, uniquely-coded rule set: paediatric/adult GLU bands plus a second instrument.
+    rs_code = f"RS-E2E-{uuid.uuid4().hex[:8]}"
+    st, rs = http("POST", f"{base}/rule-sets", {
+        "ruleSetCode": rs_code,
+        "rules": [
+            {"analyteCode": "GLU", "instrumentCode": "AU5800", "ageLowDays": 0, "ageHighDays": 17 * 365,
+             "refLow": "3.3", "refHigh": "5.6", "unit": "mmol/L", "flagLabel": "PEDIATRIC", "priority": 10},
+            {"analyteCode": "GLU", "instrumentCode": "AU5800", "ageLowDays": 18 * 365, "ageHighDays": None,
+             "refLow": "3.9", "refHigh": "6.1", "unit": "mmol/L", "flagLabel": "ADULT", "priority": 20},
+            {"analyteCode": "GLU", "instrumentCode": "BS2000", "ageLowDays": 18 * 365, "ageHighDays": None,
+             "refLow": "4.0", "refHigh": "6.3", "unit": "mmol/L", "flagLabel": "ADULT", "priority": 20},
+        ],
+    }, operator_headers())
+    record(st == 200, "semantic.rule_set_created", f"http={st} code={rs_code}")
+    rule_set_id = rs.get("rule_set_id")
+    st, _ = http("POST", f"{base}/rule-sets/{rule_set_id}/publish", {}, operator_headers())
+    record(st == 200, "semantic.rule_set_published", f"http={st}")
+
+    # --- Case A: child/adult handoff (10yo, 5.55 -> legacy HIGH, directory NORMAL) ---
+    sid_a, rep_a = uniq("E2E-SR-AGE-S"), uniq("E2E-SR-AGE-R")
+    deliver(TENANT, "sample", sample_payload_aged(sid_a, 3650))
+    deliver(TENANT, "result", result_payload_full(uniq("E2E-SR-AGE-RES"), sid_a,
+            "AU5800", "5.55", "3.9", "5.5", 3650))
+    deliver(TENANT, "report", report_payload(rep_a, sid_a, 1))
+    st, shadow_a = http("POST", f"{base}/shadow/render", {
+        "space": "OLD", "reportId": rep_a, "revision": 1,
+        "ruleSetId": rule_set_id, "reason": "E2E_AGE",
+    }, operator_headers())
+    types_a = [t.get("diffType") for t in shadow_a.get("triage", [])]
+    record(st == 200 and "AGE_BOUNDARY" in types_a, "semantic.age_boundary_shadow_diff",
+           f"http={st} diffs={types_a}")
+    base_flag = (shadow_a.get("baselineRows") or [{}])[0].get("flag")
+    cand_flag = (shadow_a.get("candidateRows") or [{}])[0].get("flag")
+    record(base_flag == "HIGH" and cand_flag == "NORMAL", "semantic.age_flag_flips_high_to_normal",
+           f"baseline={base_flag} candidate={cand_flag}")
+
+    # --- Case B: instrument replacement (adult BS2000, 6.2 -> legacy HIGH, directory NORMAL) ---
+    sid_b, rep_b = uniq("E2E-SR-INST-S"), uniq("E2E-SR-INST-R")
+    deliver(TENANT, "sample", sample_payload_aged(sid_b, 8000))
+    deliver(TENANT, "result", result_payload_full(uniq("E2E-SR-INST-RES"), sid_b,
+            "BS2000", "6.2", "3.9", "6.1", 8000))
+    deliver(TENANT, "report", report_payload(rep_b, sid_b, 1))
+    st, shadow_b = http("POST", f"{base}/shadow/render", {
+        "space": "OLD", "reportId": rep_b, "revision": 1,
+        "ruleSetId": rule_set_id, "reason": "E2E_INSTRUMENT",
+    }, operator_headers())
+    types_b = [t.get("diffType") for t in shadow_b.get("triage", [])]
+    record(st == 200 and "INSTRUMENT_SWITCH" in types_b, "semantic.instrument_switch_shadow_diff",
+           f"http={st} diffs={types_b}")
+    blocking = [t for t in shadow_a.get("triage", []) + shadow_b.get("triage", [])
+                if t.get("severity") == "BLOCKING" and t.get("status") == "OPEN"]
+    record(not blocking, "semantic.expected_changes_are_not_blocking",
+           f"openBlocking={len(blocking)}")
+
+    # --- Gate opens and serves an authoritative point-in-time replay ---
+    http("POST", f"{base}/gate/begin",
+         {"ruleSetId": rule_set_id, "historyMode": "REPLAYED"}, operator_headers())
+    st, enabled = http("POST", f"{base}/gate/enable", {}, operator_headers())
+    record(st == 200 and enabled.get("state") == "ENABLED", "semantic.gate_enabled",
+           f"http={st} state={enabled.get('state')} openBlocking={enabled.get('blockingTriageCount')}")
+    st, interp = http("GET", f"{base}/reports/{rep_a}/interpretation?revision=1")
+    flags = [i.get("flag") for i in interp.get("interpretations", [])]
+    record(st == 200 and interp.get("authoritative") is True
+           and interp.get("interpretationSource") == "REPLAYED" and "NORMAL" in flags,
+           "semantic.authoritative_replay_at_report_time",
+           f"http={st} source={interp.get('interpretationSource')} flags={flags}")
+
+    # Historical display: the same report still carries its materialised OLD interpretation.
+    st, _ = http("POST", f"{base}/history/materialize", {"space": "OLD", "limit": 100}, operator_headers())
+    st, stored = http("GET", f"{base}/interpretations/{rep_a}?revision=1")
+    hist = stored.get("interpretations", [])
+    record(st == 200 and hist and hist[0].get("flag") == "HIGH"
+           and hist[0].get("historyMode") == "MATERIALIZED",
+           "semantic.materialized_history_keeps_old_interpretation",
+           f"http={st} flag={hist[0].get('flag') if hist else None}")
+
+    # --- Case C: withdrawing the released rule fails routing closed but publication stays up ---
+    st, _ = http("POST", f"{base}/rule-sets/{rule_set_id}/withdraw",
+                 {"reason": "e2e recall after release"}, operator_headers())
+    record(st == 200, "semantic.rule_set_withdrawn", f"http={st}")
+    st, blocked = http("GET", f"{base}/reports/{rep_a}/interpretation?revision=1")
+    # The HTTP withdrawal blocks the gate immediately; a later serve then refuses with either
+    # RULE_WITHDRAWN (if the serve-time check trips first) or SEMANTIC_ROUTE_BLOCKED. Both are
+    # explicit 409 fail-closed outcomes - never a silent re-interpretation.
+    record(st == 409 and blocked.get("code") in ("RULE_WITHDRAWN", "SEMANTIC_ROUTE_BLOCKED"),
+           "semantic.withdrawn_rule_blocks_route",
+           f"http={st} code={blocked.get('code')}")
+    st, gate_after = http("GET", f"{base}/gate")
+    record(gate_after.get("state") == "BLOCKED", "semantic.gate_flipped_to_blocked",
+           f"state={gate_after.get('state')} reason={gate_after.get('lastGateReason')}")
+    st, published = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep_a}")
+    record(st == 200 and published.get("visibleState") == "VERIFIED"
+           and published.get("semanticGateState") == "BLOCKED",
+           "semantic.publication_continuous_under_block",
+           f"http={st} visible={published.get('visibleState')} gate={published.get('semanticGateState')}")
+
+    # Convergence: reset the gate so the next run starts clean.
+    http("POST", f"{base}/gate/reset", {"reason": "e2e convergence"}, operator_headers())
+
+
 def main() -> int:
     print(f"LabRoute e2e verification against {BASE} (tenant={TENANT})")
     st, health = http("GET", "/api/health")
@@ -366,6 +492,7 @@ def main() -> int:
     scenario_report_revision()
     scenario_isolation_change()
     scenario_fence_burst()
+    scenario_semantic_routing()
     return finish()
 
 

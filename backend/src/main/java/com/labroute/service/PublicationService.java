@@ -31,14 +31,19 @@ public class PublicationService {
     private final CryptoSupport crypto;
     private final EvidenceService evidence;
     private final MigrationService migrations;
+    private final SemanticRoutingService semanticRouting;
+    private final TemplateRouteGate routeGate;
 
     public PublicationService(JdbcTemplate jdbc, TenantService tenants, CryptoSupport crypto,
-                              EvidenceService evidence, MigrationService migrations) {
+                              EvidenceService evidence, MigrationService migrations,
+                              SemanticRoutingService semanticRouting, TemplateRouteGate routeGate) {
         this.jdbc = jdbc;
         this.tenants = tenants;
         this.crypto = crypto;
         this.evidence = evidence;
         this.migrations = migrations;
+        this.semanticRouting = semanticRouting;
+        this.routeGate = routeGate;
     }
 
     public record PublishResult(Map<String, Object> body, int httpStatus) {
@@ -156,11 +161,34 @@ public class PublicationService {
         report.put("phase", tenant.phase());
         report.put("servedAt", java.time.Instant.now().toString());
         report.put("history", revisionHistory(revisions));
+        attachSemanticRouting(tenant, report, reportId, revision);
         recordPublication(tenant, reportId, revision, readSpace, "VERIFIED", report, null);
         evidence.append(tenant.tenantId(), "REPORT_SERVED", "REPORT", reportId, readSpace, "VERIFIED",
                 Map.of("reportId", reportId, "revision", revision, "contentHash", newest.get("content_hash"),
                         "fenced", fenced, "generation", tenant.generation()));
         return new PublishResult(report, 200);
+    }
+
+    /**
+     * Attaches the unified semantic interpretation without ever breaking continuous publication:
+     * when the gate blocks routing (e.g. an active rule set was withdrawn) the document is still
+     * served and the block is reported explicitly in the response rather than as a 5xx.
+     */
+    private void attachSemanticRouting(Tenant tenant, Map<String, Object> report, String reportId, int revision) {
+        try {
+            Map<String, Object> interpretation = semanticRouting.interpret(tenant, reportId, revision);
+            report.put("semanticGateState", interpretation.get("gateState"));
+            report.put("interpretationAuthoritative", interpretation.get("authoritative"));
+            report.put("interpretationSource", interpretation.get("interpretationSource"));
+            report.put("interpretations", interpretation.get("interpretations"));
+        } catch (ApiException e) {
+            report.put("semanticGateState", "BLOCKED");
+            report.put("interpretationAuthoritative", false);
+            report.put("semanticRoutingBlocked", Map.of("code", e.code(), "message", e.getMessage(),
+                    "details", e.details()));
+            evidence.append(tenant.tenantId(), "SEMANTIC_ROUTE_BLOCKED_ON_PUBLISH", "REPORT", reportId,
+                    null, "PENDING_VERIFICATION", Map.of("code", e.code(), "message", e.getMessage()));
+        }
     }
 
     private Map<String, Object> pendingBody(Tenant tenant, String reportId, int revision, String readSpace,

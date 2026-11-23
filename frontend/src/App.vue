@@ -11,6 +11,7 @@ const nav = [
   { to: '/migration', label: '迁移控制', key: 'migration' },
   { to: '/gateway', label: '接入网关', key: 'gateway' },
   { to: '/publishing', label: '发布台', key: 'publishing' },
+  { to: '/semantic', label: '语义路由', key: 'semantic' },
   { to: '/boundary', label: '边界册', key: 'boundary' },
   { to: '/lab', label: '验证实验室', key: 'lab' }
 ]

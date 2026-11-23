@@ -2,6 +2,7 @@ package com.labroute.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.labroute.model.Tenant;
+import com.labroute.web.ApiException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
@@ -41,11 +42,19 @@ public class ScenarioService {
     private final CryptoSupport crypto;
     private final ReplicationService replication;
     private final DemoDataService demo;
+    private final TemplateCatalogService catalog;
+    private final ShadowRenderer renderer;
+    private final ShadowDiffTriage triage;
+    private final TemplateRouteGate gate;
+    private final SemanticRoutingService routing;
 
     public ScenarioService(JdbcTemplate jdbc, TenantService tenants, IntakeService intake,
                            MigrationService migrations, PublicationService publication,
                            EvidenceService evidence, PolicyService policies, CryptoSupport crypto,
-                           ReplicationService replication, DemoDataService demo) {
+                           ReplicationService replication, DemoDataService demo,
+                           TemplateCatalogService catalog, ShadowRenderer renderer,
+                           ShadowDiffTriage triage, TemplateRouteGate gate,
+                           SemanticRoutingService routing) {
         this.jdbc = jdbc;
         this.tenants = tenants;
         this.intake = intake;
@@ -56,6 +65,11 @@ public class ScenarioService {
         this.crypto = crypto;
         this.replication = replication;
         this.demo = demo;
+        this.catalog = catalog;
+        this.renderer = renderer;
+        this.triage = triage;
+        this.gate = gate;
+        this.routing = routing;
     }
 
     public record Assertion(String name, boolean passed, String detail) {
@@ -75,6 +89,7 @@ public class ScenarioService {
                 case "REPORT_REVISION" -> reportRevision(tenant, assertions, artifacts);
                 case "ISOLATION_CHANGE" -> isolationChange(tenant, assertions, artifacts);
                 case "FENCE_BURST" -> fenceBurst(tenant, assertions, artifacts);
+                case "SEMANTIC_ROUTING" -> semanticRouting(tenant, assertions, artifacts);
                 default -> throw new IllegalArgumentException("unknown scenario " + scenarioCode);
             }
         } catch (Exception e) {
@@ -421,6 +436,165 @@ public class ScenarioService {
         return n == null ? 0 : n;
     }
 
+    // ---------- semantic routing ----------
+
+    /**
+     * End-to-end exercise of unified semantic routing through the real services: child/adult
+     * interval handoff, instrument replacement, the enable gate (including refusal on a BLOCKING
+     * finding), both history strategies, and fail-closed routing when a rule set is withdrawn.
+     * Creates its own rule set versions so the seeded catalogue is never destructively modified,
+     * and resets the gate to SHADOW at the end so repeated runs converge.
+     */
+    private void semanticRouting(Tenant tenant, List<Assertion> assertions, Map<String, Object> art) {
+        // Clean slate: a previous run leaves a SHADOW gate and possibly OPEN triage findings.
+        gate.ensureGate(tenant.tenantId(), TemplateRouteGate.MODE_REPLAYED);
+        int preClean = triage.resolveAllOpen(tenant.tenantId(), "scenario pre-clean");
+        gate.resetToShadow(tenants.requireById(tenant.tenantId()), "scenario pre-clean");
+        art.put("preCleanDismissed", preClean);
+
+        String rsCode = "RS-SCEN-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        var rules = java.util.List.of(
+                new TemplateCatalogService.RuleSpec("GLU", "AU5800", 0L, 17L * 365L, null,
+                        new java.math.BigDecimal("3.3"), new java.math.BigDecimal("5.6"),
+                        "mmol/L", "PEDIATRIC", 10),
+                new TemplateCatalogService.RuleSpec("GLU", "AU5800", 18L * 365L, null, null,
+                        new java.math.BigDecimal("3.9"), new java.math.BigDecimal("6.1"),
+                        "mmol/L", "ADULT", 20),
+                new TemplateCatalogService.RuleSpec("GLU", "BS2000", 18L * 365L, null, null,
+                        new java.math.BigDecimal("4.0"), new java.math.BigDecimal("6.3"),
+                        "mmol/L", "ADULT", 20));
+        Map<String, Object> ruleSet = catalog.createRuleSet(tenant.tenantId(),
+                new TemplateCatalogService.RuleSetRequest(rsCode, null, rules));
+        String ruleSetId = String.valueOf(ruleSet.get("rule_set_id"));
+        catalog.publishRuleSet(tenant.tenantId(), ruleSetId, null, "scenario semantic rule set");
+        art.put("ruleSetId", ruleSetId);
+
+        // 1) Child/adult handoff: 10-year-old, HIGH on legacy adult interval, NORMAL on paediatric.
+        var ageIds = deliverSemanticReport(tenant, "AGE", "AU5800", "5.55", "3.9", "5.5", 3650L);
+        gate.ensureGate(tenant.tenantId(), TemplateRouteGate.MODE_REPLAYED);
+        ShadowRenderer.ShadowResult ageShadow = renderer.renderReport(tenant, "OLD",
+                ageIds.get("reportId"), 1, java.util.UUID.fromString(ruleSetId), "SCEN_AGE");
+        art.put("ageShadow", Map.of("result", ageShadow.result(), "diffs", ageShadow.diffs()));
+        assertions.add(new Assertion("semantic.ageBoundaryDiffClassified",
+                ageShadow.diffs().stream().anyMatch(d -> "AGE_BOUNDARY".equals(d.diffType())
+                        && ShadowDiffTriage.SEV_EXPECTED.equals(d.severity())),
+                "diffs=" + ageShadow.diffs().stream().map(ShadowDiffTriage.Diff::diffType).toList()));
+        assertions.add(new Assertion("semantic.ageFlagFlipsHighToNormal",
+                "HIGH".equals(ageShadow.baselineRows().get(0).get("flag"))
+                        && "NORMAL".equals(ageShadow.candidateRows().get(0).get("flag")),
+                "baseline=" + ageShadow.baselineRows().get(0).get("flag")
+                        + " candidate=" + ageShadow.candidateRows().get(0).get("flag")));
+
+        // 2) Instrument replacement: BS2000 adult, legacy AU5800 interval HIGH vs BS2000 NORMAL.
+        var instIds = deliverSemanticReport(tenant, "INST", "BS2000", "6.2", "3.9", "6.1", 8000L);
+        ShadowRenderer.ShadowResult instShadow = renderer.renderReport(tenant, "OLD",
+                instIds.get("reportId"), 1, java.util.UUID.fromString(ruleSetId), "SCEN_INSTRUMENT");
+        art.put("instrumentShadow", Map.of("result", instShadow.result(), "diffs", instShadow.diffs()));
+        assertions.add(new Assertion("semantic.instrumentSwitchExpected",
+                instShadow.diffs().stream().anyMatch(d -> "INSTRUMENT_SWITCH".equals(d.diffType())
+                        && ShadowDiffTriage.SEV_EXPECTED.equals(d.severity())),
+                "diffs=" + instShadow.diffs().stream().map(ShadowDiffTriage.Diff::diffType).toList()));
+        assertions.add(new Assertion("semantic.noBlockingDiffForExpectedChanges",
+                instShadow.diffs().stream().noneMatch(d -> ShadowDiffTriage.SEV_BLOCKING.equals(d.severity()))
+                        && ageShadow.diffs().stream().noneMatch(d -> ShadowDiffTriage.SEV_BLOCKING.equals(d.severity())),
+                "blocking count stays zero for age/instrument changes"));
+
+        // 3) Gate opens without a BLOCKING finding and serves an authoritative replay.
+        gate.beginEvaluation(tenant, null, ruleSetId, TemplateRouteGate.MODE_REPLAYED);
+        gate.enable(tenant);
+        Tenant enabled = tenants.requireById(tenant.tenantId());
+        assertions.add(new Assertion("semantic.gateEnabled",
+                TemplateRouteGate.STATE_ENABLED.equals(gate.require(tenant.tenantId()).state()),
+                "state=" + gate.require(tenant.tenantId()).state()));
+        Map<String, Object> replayed = routing.interpret(enabled, ageIds.get("reportId"), 1);
+        assertions.add(new Assertion("semantic.replayAuthoritativeAtReportTime",
+                Boolean.TRUE.equals(replayed.get("authoritative"))
+                        && "REPLAYED".equals(replayed.get("interpretationSource"))
+                        && "NORMAL".equals(((List<Map<String, Object>>) replayed.get("interpretations"))
+                        .get(0).get("flag")),
+                "source=" + replayed.get("interpretationSource")));
+
+        // 4) Materialised history freezes the OLD interpretation (HIGH) for stable historical display.
+        gate.beginEvaluation(tenants.requireById(tenant.tenantId()), null, ruleSetId,
+                TemplateRouteGate.MODE_MATERIALIZED);
+        gate.enable(tenants.requireById(tenant.tenantId()));
+        renderer.materializeLegacy(tenants.requireById(tenant.tenantId()), "OLD", 100);
+        Map<String, Object> materialized = routing.interpret(
+                tenants.requireById(tenant.tenantId()), ageIds.get("reportId"), 1);
+        assertions.add(new Assertion("semantic.materializedHistoryFreezesOldInterpretation",
+                "MATERIALIZED".equals(materialized.get("interpretationSource"))
+                        && "HIGH".equals(((List<Map<String, Object>>) materialized.get("interpretations"))
+                        .get(0).get("flag")),
+                "source=" + materialized.get("interpretationSource")));
+
+        // 5) Withdrawal fails the gate closed while publication stays continuous.
+        catalog.withdrawRuleSet(tenant.tenantId(), ruleSetId, "scenario recall after release");
+        boolean withdrawnBlocked = false;
+        try {
+            routing.interpret(tenants.requireById(tenant.tenantId()), ageIds.get("reportId"), 1);
+        } catch (ApiException e) {
+            withdrawnBlocked = "RULE_WITHDRAWN".equals(e.code());
+        }
+        assertions.add(new Assertion("semantic.withdrawnRuleBlocksRouting", withdrawnBlocked,
+                "interpret after withdrawal threw RULE_WITHDRAWN=" + withdrawnBlocked));
+        assertions.add(new Assertion("semantic.gateFlippedToBlocked",
+                TemplateRouteGate.STATE_BLOCKED.equals(gate.require(tenant.tenantId()).state()),
+                "state=" + gate.require(tenant.tenantId()).state()));
+        PublicationService.PublishResult stillPublished = publication.publish(
+                tenant.code(), ageIds.get("reportId"));
+        assertions.add(new Assertion("semantic.publicationContinuousUnderBlock",
+                stillPublished.httpStatus() == 200 && "VERIFIED".equals(stillPublished.body().get("visibleState"))
+                        && "BLOCKED".equals(stillPublished.body().get("semanticGateState")),
+                "http=" + stillPublished.httpStatus() + " gate=" + stillPublished.body().get("semanticGateState")));
+
+        // 6) A rule set that cannot resolve GLU produces a BLOCKING NO_RULE diff and the gate refuses.
+        var creaSpecs = java.util.List.of(new TemplateCatalogService.RuleSpec("CREA", null,
+                18L * 365L, null, null, new java.math.BigDecimal("45"), new java.math.BigDecimal("104"),
+                "umol/L", "ADULT", 20));
+        Map<String, Object> creaSet = catalog.createRuleSet(tenant.tenantId(),
+                new TemplateCatalogService.RuleSetRequest("RS-CREA-" + java.util.UUID.randomUUID()
+                        .toString().substring(0, 8), null, creaSpecs));
+        String creaId = String.valueOf(creaSet.get("rule_set_id"));
+        catalog.publishRuleSet(tenant.tenantId(), creaId, null, "scenario crea-only set");
+        gate.resetToShadow(tenants.requireById(tenant.tenantId()), "scenario reset for refusal check");
+        ShadowRenderer.ShadowResult noRuleShadow = renderer.renderReport(tenant, "OLD",
+                ageIds.get("reportId"), 1, java.util.UUID.fromString(creaId), "SCEN_NO_RULE");
+        boolean blockingNoRule = noRuleShadow.diffs().stream()
+                .anyMatch(d -> "NO_RULE".equals(d.diffType()) && ShadowDiffTriage.SEV_BLOCKING.equals(d.severity()));
+        gate.beginEvaluation(tenants.requireById(tenant.tenantId()), null, creaId,
+                TemplateRouteGate.MODE_REPLAYED);
+        boolean refused = false;
+        try {
+            gate.enable(tenants.requireById(tenant.tenantId()));
+        } catch (ApiException e) {
+            refused = "ROUTE_GATE_BLOCKED".equals(e.code());
+        }
+        assertions.add(new Assertion("semantic.enableRefusedOnBlockingDiff", blockingNoRule && refused,
+                "noRuleBlocking=" + blockingNoRule + " gateRefused=" + refused));
+
+        // Convergence: dismiss the deliberately-produced finding and leave the gate in SHADOW.
+        int closed = triage.resolveAllOpen(tenant.tenantId(), "scenario convergence cleanup");
+        gate.resetToShadow(tenants.requireById(tenant.tenantId()), "scenario convergence cleanup");
+        assertions.add(new Assertion("semantic.gateResetToShadow",
+                TemplateRouteGate.STATE_SHADOW.equals(gate.require(tenant.tenantId()).state())
+                        && gate.openBlockingCount(tenant.tenantId()) == 0,
+                "final state=" + gate.require(tenant.tenantId()).state()
+                        + " dismissed=" + closed));
+    }
+
+    private Map<String, String> deliverSemanticReport(Tenant tenant, String suffix, String instrument,
+                                                      String value, String legacyLow, String legacyHigh,
+                                                      Long ageDays) {
+        String sid = demo.uniqueKey("SM-" + suffix + "-S");
+        String rid = demo.uniqueKey("SM-" + suffix + "-R");
+        String rep = demo.uniqueKey("SM-" + suffix + "-REP");
+        demo.deliver(tenant, "sample", demo.samplePayload(sid, "SOURCE-A", ageDays, null), null, null);
+        demo.deliver(tenant, "result", demo.resultPayload(rid, sid, "GLU", instrument, value, "mmol/L",
+                legacyLow, legacyHigh, ageDays, null), null, null);
+        demo.deliver(tenant, "report", demo.reportPayload(rep, sid, 1, "semantic-" + suffix), null, null);
+        return Map.of("sampleId", sid, "resultId", rid, "reportId", rep);
+    }
+
     // ---------- helpers ----------
 
     private Map<String, Object> receipt(Tenant tenant, List<Assertion> assertions, Map<String, Object> art,
@@ -477,7 +651,7 @@ public class ScenarioService {
     }
 
     public List<String> scenarios() {
-        return List.of("LATE_RESULT", "REPORT_REVISION", "ISOLATION_CHANGE", "FENCE_BURST");
+        return List.of("LATE_RESULT", "REPORT_REVISION", "ISOLATION_CHANGE", "FENCE_BURST", "SEMANTIC_ROUTING");
     }
 
     public Map<String, Object> runAll(String tenantCode) {
